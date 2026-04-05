@@ -487,6 +487,9 @@ class DFINETransformer(nn.Module):
         reg_max=32,
         reg_scale=4.0,
         layer_scale=1,
+        trust_enabled=False,
+        trust_topk=4,
+        trust_hidden_dim=64,
     ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -507,6 +510,8 @@ class DFINETransformer(nn.Module):
         self.eval_spatial_size = eval_spatial_size
         self.aux_loss = aux_loss
         self.reg_max = reg_max
+        self.trust_enabled = trust_enabled
+        self.trust_topk = trust_topk
 
         assert query_select_method in ("default", "one2many", "agnostic"), ""
         assert cross_attn_method in ("default", "discrete"), ""
@@ -611,6 +616,7 @@ class DFINETransformer(nn.Module):
             ]
         )
         self.integral = Integral(self.reg_max)
+        self.trust_head = MLP(7, trust_hidden_dim, 1, 2) if trust_enabled else None
 
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
@@ -648,6 +654,10 @@ class DFINETransformer(nn.Module):
             if hasattr(reg_, "layers"):
                 init.constant_(reg_.layers[-1].weight, 0)
                 init.constant_(reg_.layers[-1].bias, 0)
+
+        if self.trust_head is not None:
+            init.constant_(self.trust_head.layers[-1].weight, 0)
+            init.constant_(self.trust_head.layers[-1].bias, 0)
 
         init.xavier_uniform_(self.enc_output[0].weight)
         if self.learn_query_content:
@@ -887,6 +897,8 @@ class DFINETransformer(nn.Module):
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta["dn_num_split"], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta["dn_num_split"], dim=2)
 
+        trust_scores = self._predict_trust_scores(out_logits, out_bboxes, out_corners)
+
         if self.training:
             out = {
                 "pred_logits": out_logits[-1],
@@ -895,6 +907,7 @@ class DFINETransformer(nn.Module):
                 "ref_points": out_refs[-1],
                 "up": self.up,
                 "reg_scale": self.reg_scale,
+                "trust_scores": trust_scores,
             }
         else:
             out = {"pred_logits": out_logits[-1], "pred_boxes": out_bboxes[-1]}
@@ -907,6 +920,7 @@ class DFINETransformer(nn.Module):
                 out_refs[:-1],
                 out_corners[-1],
                 out_logits[-1],
+                trust_scores,
             )
             out["enc_aux_outputs"] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out["pre_outputs"] = {"pred_logits": pre_logits, "pred_boxes": pre_bboxes}
@@ -926,6 +940,31 @@ class DFINETransformer(nn.Module):
 
         return out
 
+    def _predict_trust_scores(self, out_logits, out_bboxes, out_corners):
+        if not self.training or not self.trust_enabled:
+            return None
+
+        final_corners = out_corners[-1].detach()
+        final_logits = out_logits[-1].detach()
+        final_boxes = out_bboxes[-1].detach()
+        prev_boxes = out_bboxes[-2].detach() if out_bboxes.shape[0] > 1 else final_boxes
+
+        prob = F.softmax(final_corners.reshape(*final_corners.shape[:2], 4, self.reg_max + 1), dim=-1)
+        entropy = -(prob * torch.log(prob.clamp(min=1e-8))).sum(-1).mean(-1, keepdim=True)
+
+        k = min(self.trust_topk, prob.shape[-1])
+        prob_topk, _ = prob.topk(k, dim=-1)
+        top1 = prob_topk[..., 0].mean(-1, keepdim=True)
+        top2 = prob_topk[..., : min(2, k)].sum(-1).mean(-1, keepdim=True)
+        topk_mass = prob_topk.sum(-1).mean(-1, keepdim=True)
+
+        cls_conf = final_logits.sigmoid().max(dim=-1, keepdim=True)[0]
+        drift = (final_boxes - prev_boxes).abs().sum(-1, keepdim=True)
+        log_area = (final_boxes[..., 2] * final_boxes[..., 3]).clamp(min=1e-8).log().unsqueeze(-1)
+
+        trust_feat = torch.cat([entropy, top1, top2, topk_mass, cls_conf, drift, log_area], dim=-1)
+        return torch.sigmoid(self.trust_head(trust_feat))
+
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):
         # this is a workaround to make torchscript happy, as torchscript
@@ -942,6 +981,7 @@ class DFINETransformer(nn.Module):
         outputs_ref,
         teacher_corners=None,
         teacher_logits=None,
+        trust_scores=None,
     ):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
@@ -954,6 +994,7 @@ class DFINETransformer(nn.Module):
                 "ref_points": d,
                 "teacher_corners": teacher_corners,
                 "teacher_logits": teacher_logits,
+                "trust_scores": trust_scores,
             }
             for a, b, c, d in zip(outputs_class, outputs_coord, outputs_corners, outputs_ref)
         ]

@@ -42,6 +42,8 @@ class DFINECriterion(nn.Module):
         reg_max=32,
         boxes_weight_format=None,
         share_matched_indices=False,
+        trust_alpha=0.5,
+        trust_eps=1e-6,
     ):
         """Create the criterion.
         Parameters:
@@ -65,6 +67,8 @@ class DFINECriterion(nn.Module):
         self.own_targets, self.own_targets_dn = None, None
         self.reg_max = reg_max
         self.num_pos, self.num_neg = None, None
+        self.trust_alpha = trust_alpha
+        self.trust_eps = trust_eps
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert "pred_logits" in outputs
@@ -136,6 +140,29 @@ class DFINECriterion(nn.Module):
 
         return losses
 
+    def loss_trust(self, outputs, targets, indices, num_boxes):
+        if "trust_scores" not in outputs or outputs["trust_scores"] is None:
+            return {"loss_trust": outputs["pred_boxes"].sum() * 0}
+
+        idx = self._get_src_permutation_idx(indices)
+        if idx[0].numel() == 0:
+            return {"loss_trust": outputs["trust_scores"].sum() * 0}
+
+        pred_boxes = outputs["pred_boxes"][idx].detach()
+        target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+
+        ious = torch.diag(
+            box_iou(box_cxcywh_to_xyxy(pred_boxes), box_cxcywh_to_xyxy(target_boxes))[0]
+        ).detach()
+        center_dist = torch.norm(pred_boxes[:, :2] - target_boxes[:, :2], dim=-1)
+        gt_area = (target_boxes[:, 2] * target_boxes[:, 3]).clamp(min=self.trust_eps)
+        center_term = torch.exp(-center_dist / (gt_area.sqrt() + self.trust_eps))
+
+        target = self.trust_alpha * ious + (1 - self.trust_alpha) * center_term
+        pred = outputs["trust_scores"][idx].squeeze(-1)
+        loss = F.smooth_l1_loss(pred, target, reduction="sum") / num_boxes
+        return {"loss_trust": loss}
+
     def loss_local(self, outputs, targets, indices, num_boxes, T=5):
         """Compute Fine-Grained Localization (FGL) Loss
         and Decoupled Distillation Focal (DDF) Loss."""
@@ -192,14 +219,21 @@ class DFINECriterion(nn.Module):
                     losses["loss_ddf"] = pred_corners.sum() * 0
                 else:
                     weight_targets_local = outputs["teacher_logits"].sigmoid().max(dim=-1)[0]
+                    weight_targets_local = weight_targets_local.clone()
+                    query_mask = torch.zeros_like(weight_targets_local, dtype=torch.bool)
+                    query_mask[idx] = True
 
-                    mask = torch.zeros_like(weight_targets_local, dtype=torch.bool)
-                    mask[idx] = True
-                    mask = mask.unsqueeze(-1).repeat(1, 1, 4).reshape(-1)
+                    if "trust_scores" in outputs and outputs["trust_scores"] is not None:
+                        trust_scores = outputs["trust_scores"].squeeze(-1).detach()
+                        weight_targets_local[query_mask] = trust_scores[query_mask].to(
+                            weight_targets_local.dtype
+                        )
+                    else:
+                        weight_targets_local[query_mask] = ious.reshape_as(
+                            weight_targets_local[query_mask]
+                        ).to(weight_targets_local.dtype)
 
-                    weight_targets_local[idx] = ious.reshape_as(weight_targets_local[idx]).to(
-                        weight_targets_local.dtype
-                    )
+                    mask = query_mask.unsqueeze(-1).repeat(1, 1, 4).reshape(-1)
                     weight_targets_local = (
                         weight_targets_local.unsqueeze(-1).repeat(1, 1, 4).reshape(-1).detach()
                     )
@@ -276,6 +310,7 @@ class DFINECriterion(nn.Module):
             "focal": self.loss_labels_focal,
             "vfl": self.loss_labels_vfl,
             "local": self.loss_local,
+            "trust": self.loss_trust,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -340,6 +375,8 @@ class DFINECriterion(nn.Module):
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
                 aux_outputs["up"], aux_outputs["reg_scale"] = outputs["up"], outputs["reg_scale"]
                 for loss in self.losses:
+                    if loss == "trust":
+                        continue
                     indices_in = indices_go if loss in ["boxes", "local"] else cached_indices[i]
                     num_boxes_in = num_boxes_go if loss in ["boxes", "local"] else num_boxes
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_in)
@@ -357,6 +394,8 @@ class DFINECriterion(nn.Module):
         if "pre_outputs" in outputs:
             aux_outputs = outputs["pre_outputs"]
             for loss in self.losses:
+                if loss == "trust":
+                    continue
                 indices_in = indices_go if loss in ["boxes", "local"] else cached_indices[-1]
                 num_boxes_in = num_boxes_go if loss in ["boxes", "local"] else num_boxes
                 meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_in)
@@ -383,6 +422,8 @@ class DFINECriterion(nn.Module):
 
             for i, aux_outputs in enumerate(outputs["enc_aux_outputs"]):
                 for loss in self.losses:
+                    if loss == "trust":
+                        continue
                     indices_in = indices_go if loss == "boxes" else cached_indices_enc[i]
                     num_boxes_in = num_boxes_go if loss == "boxes" else num_boxes
                     meta = self.get_loss_meta_info(loss, aux_outputs, enc_targets, indices_in)
@@ -409,6 +450,8 @@ class DFINECriterion(nn.Module):
                 aux_outputs["is_dn"] = True
                 aux_outputs["up"], aux_outputs["reg_scale"] = outputs["up"], outputs["reg_scale"]
                 for loss in self.losses:
+                    if loss == "trust":
+                        continue
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_dn)
                     l_dict = self.get_loss(
                         loss, aux_outputs, targets, indices_dn, dn_num_boxes, **meta
@@ -423,6 +466,8 @@ class DFINECriterion(nn.Module):
             if "dn_pre_outputs" in outputs:
                 aux_outputs = outputs["dn_pre_outputs"]
                 for loss in self.losses:
+                    if loss == "trust":
+                        continue
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_dn)
                     l_dict = self.get_loss(
                         loss, aux_outputs, targets, indices_dn, dn_num_boxes, **meta

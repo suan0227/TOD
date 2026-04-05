@@ -6,6 +6,7 @@ Modified from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright (c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+# import re
 import os
 import sys
 import torch
@@ -56,6 +57,15 @@ def main(args) -> None:
             and v is not None
         }
     )
+
+    # # update_dict 생성 후
+    # exp_name = update_dict.get("exp_name")
+    # if exp_name and not update_dict.get("output_dir"):
+    #     safe_exp = re.sub(r"[^a-zA-Z0-9._-]", "_", str(exp_name))
+    #     update_dict["output_dir"] = f"./logs/{safe_exp}"
+
+    # if update_dict.get("output_dir") and not update_dict.get("summary_dir"):
+    #     update_dict["summary_dir"] = f"{update_dict['output_dir']}/summary"
 
     cfg = YAMLConfig(args.config, **update_dict)
 

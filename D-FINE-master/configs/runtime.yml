@@ -21,4 +21,4 @@ ema:
 
 use_wandb: True
 project_name: TOD # for wandb
-exp_name: D-Fine_S_sample # wandb experiment name
+exp_name: dfine_s_baseline # wandb experiment name

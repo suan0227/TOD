@@ -63,6 +63,8 @@ class DetSolver(BaseSolver):
         print(model_stats)
         print("-" * 42 + "Start training" + "-" * 43)
         top1 = 0
+        best_very_tiny = float("-inf")
+        best_very_tiny_epoch = -1
         best_stat = {
             "epoch": -1,
         }
@@ -78,6 +80,9 @@ class DetSolver(BaseSolver):
                 self.last_epoch,
                 self.use_wandb
             )
+            if "AP_very_tiny" in test_stats:
+                best_very_tiny = _to_scalar_for_best(test_stats["AP_very_tiny"])
+                best_very_tiny_epoch = self.last_epoch
             for k in test_stats:
                 metric_value = _to_scalar_for_best(test_stats[k])
                 best_stat["epoch"] = self.last_epoch
@@ -144,6 +149,28 @@ class DetSolver(BaseSolver):
                 output_dir=self.output_dir,
             )
 
+            if "AP_very_tiny" in test_stats:
+                current_very_tiny = _to_scalar_for_best(test_stats["AP_very_tiny"])
+                if current_very_tiny > best_very_tiny:
+                    best_very_tiny = current_very_tiny
+                    best_very_tiny_epoch = epoch
+                    if self.output_dir:
+                        dist_utils.save_on_master(
+                            self.state_dict(), self.output_dir / "best_very_tiny.pth"
+                        )
+                        stage_best_name = (
+                            "best_very_tiny_stg2.pth"
+                            if epoch >= self.train_dataloader.collate_fn.stop_epoch
+                            else "best_very_tiny_stg1.pth"
+                        )
+                        dist_utils.save_on_master(
+                            self.state_dict(), self.output_dir / stage_best_name
+                        )
+                    print(
+                        f"best_very_tiny: epoch={best_very_tiny_epoch}, "
+                        f"AP_very_tiny={best_very_tiny:.6f}"
+                    )
+
             # TODO
             for k in test_stats:
                 metric_value = _to_scalar_for_best(test_stats[k])
@@ -206,6 +233,8 @@ class DetSolver(BaseSolver):
                 **{f"test_{k}": v for k, v in test_stats.items()},
                 "epoch": epoch,
                 "n_parameters": n_parameters,
+                "best_test_AP_very_tiny": best_very_tiny,
+                "best_test_AP_very_tiny_epoch": best_very_tiny_epoch,
             }
             _add_readable_val_metrics(log_stats)
 
