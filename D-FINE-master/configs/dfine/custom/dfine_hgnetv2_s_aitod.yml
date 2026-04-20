@@ -5,9 +5,18 @@ __include__: [
   '../include/dataloader.yml',
   '../include/optimizer.yml',
   '../include/dfine_hgnetv2.yml',
+  '../include/dfine_s_aitod_baseline.yml',
 ]
 
-output_dir: ./output/D-Fine_S_trust_weight
+
+output_dir: ./output/D-Fine_S_filter_trust_weight
+
+evaluator:
+  type: CocoEvaluator
+  iou_types: ['bbox']
+  allowed_area_labels: ['tiny', 'small']
+  exclude_images_without_annotations: True
+  reported_area_labels: ['tiny', 'small']
 
 
 DFINE:
@@ -57,6 +66,8 @@ epochs: 300
 train_dataloader:
   total_batch_size: 8
   dataset:
+    allowed_area_labels: ['tiny', 'small']
+    exclude_images_without_valid_annotations: True
     transforms:
       policy:
         epoch: 272
@@ -67,6 +78,9 @@ train_dataloader:
 
 val_dataloader:
   total_batch_size: 8
+  dataset:
+    allowed_area_labels: ['tiny', 'small']
+    exclude_images_without_valid_annotations: True
 
 
 DFINECriterion:

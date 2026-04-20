@@ -1,0 +1,17 @@
+__include__: [
+  './dfine_s_aitod_baseline.yml',
+]
+
+output_dir: ./output/dfine_s_scale_adaptive_matcher
+
+DFINECriterion:
+  matcher:
+    scale_adaptive_enabled: True
+    tiny_area_lower: 64
+    tiny_area_upper: 256
+    tiny_cost_bbox: 2.5
+    tiny_cost_giou: 1.0
+    tiny_cost_center: 1.5
+    tiny_cost_nwd: 2.0
+    tiny_cost_uncertainty: 0.25
+    uncertainty_type: entropy

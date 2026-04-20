@@ -1,0 +1,12 @@
+__include__: [
+  './dfine_hgnetv2_s_aitod.yml',
+    '../include/dfine_s_aitod_baseline.yml',
+]
+
+output_dir: ./output/D-Fine_S_filter_trust_scaleaware_matchedkd
+
+DFINECriterion:
+  trust_scale_weight_very_tiny: 2.5
+  trust_scale_weight_tiny: 1.75
+  trust_scale_weight_small: 1.25
+  trust_unmatched_kd_weight: 0.0

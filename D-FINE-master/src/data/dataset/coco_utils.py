@@ -4,6 +4,8 @@ copy and modified https://github.com/pytorch/vision/blob/main/references/detecti
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+import copy
+
 import faster_coco_eval.core.mask as coco_mask
 import torch
 import torch.utils.data
@@ -173,7 +175,10 @@ def convert_to_coco_api(ds):
                 ann["num_keypoints"] = sum(k != 0 for k in keypoints[i][2::3])
             dataset["annotations"].append(ann)
             ann_id += 1
-    dataset["categories"] = [{"id": i} for i in sorted(categories)]
+    if hasattr(ds, "categories") and not getattr(ds, "remap_mscoco_category", False):
+        dataset["categories"] = copy.deepcopy(ds.categories)
+    else:
+        dataset["categories"] = [{"id": i} for i in sorted(categories)]
     coco_ds.dataset = dataset
     coco_ds.createIndex()
     return coco_ds
@@ -186,6 +191,8 @@ def get_coco_api_from_dataset(dataset):
             break
         if isinstance(dataset, torch.utils.data.Subset):
             dataset = dataset.dataset
+    if getattr(dataset, "requires_coco_conversion", False):
+        return convert_to_coco_api(dataset)
     if isinstance(dataset, torchvision.datasets.CocoDetection):
         return dataset.coco
     return convert_to_coco_api(dataset)

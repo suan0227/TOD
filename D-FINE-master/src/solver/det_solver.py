@@ -47,7 +47,7 @@ class DetSolver(BaseSolver):
     def fit(self):
         self.train()
         args = self.cfg
-        metric_names = ["AP50:95", "AP50", "AP75", "APsmall", "APmedium", "APlarge"]
+        metric_names = ["AP50:95", "AP50", "AP75"]
 
         if self.use_wandb:
             import wandb
@@ -233,16 +233,19 @@ class DetSolver(BaseSolver):
                 **{f"test_{k}": v for k, v in test_stats.items()},
                 "epoch": epoch,
                 "n_parameters": n_parameters,
-                "best_test_AP_very_tiny": best_very_tiny,
-                "best_test_AP_very_tiny_epoch": best_very_tiny_epoch,
             }
+            if best_very_tiny_epoch >= 0:
+                log_stats["best_test_AP_very_tiny"] = best_very_tiny
+                log_stats["best_test_AP_very_tiny_epoch"] = best_very_tiny_epoch
             _add_readable_val_metrics(log_stats)
 
             if self.use_wandb:
                 wandb_logs = {}
                 for idx, metric_name in enumerate(metric_names):
-                    wandb_logs[f"metrics/{metric_name}"] = test_stats["coco_eval_bbox"][idx]
-                for key in ("AP_very_tiny", "AP_tiny", "AP_s", "AP_m", "AP_l"):
+                    metric_value = test_stats["coco_eval_bbox"][idx]
+                    if np.isfinite(metric_value):
+                        wandb_logs[f"metrics/{metric_name}"] = metric_value
+                for key in ("AP_tiny", "AP_s"):
                     if key in test_stats:
                         wandb_logs[f"val/{key}"] = float(test_stats[key])
                 wandb_logs["epoch"] = epoch

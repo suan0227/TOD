@@ -1,0 +1,20 @@
+__include__: [
+  './dfine_s_aitod_baseline.yml',
+]
+
+output_dir: ./output/dfine_s_teacher_mixture
+
+DFINETransformer:
+  teacher_enabled: True
+  teacher_mode: entropy_drift_mixture
+  teacher_layer_ids: [1, 2]
+  teacher_exclude_final: False
+  teacher_tau_entropy: 1.0
+  teacher_tau_drift: 1.0
+  teacher_tau_conf: 0.0
+  teacher_detach: True
+  teacher_use_prob_mixture: True
+  trust_enabled: False
+
+DFINECriterion:
+  trust_unmatched_kd_weight: 0.0

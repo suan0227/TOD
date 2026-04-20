@@ -1,0 +1,15 @@
+__include__: [
+  '../include/dfine_s_aitod_baseline.yml',
+]
+
+output_dir: ./output/dfine_s_star_step2_contrastive
+exp_name: D-dfine_s_star_step2_contrastive
+
+DFINECriterion:
+  losses: ['vfl', 'boxes', 'local', 'contrastive']
+  weight_dict:
+    loss_contrastive: 0.5
+  contrastive_bank_size: 64
+  contrastive_momentum: 0.9
+  contrastive_margin: 0.4
+  contrastive_bg_iou_threshold: 0.1

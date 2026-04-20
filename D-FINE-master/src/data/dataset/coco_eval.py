@@ -8,9 +8,11 @@ in the end of the file, as python3 can suppress prints with contextlib
 # MiXaiLL76 replacing pycocotools with faster-coco-eval for better performance and support.
 """
 
+from faster_coco_eval import COCO
 from faster_coco_eval.utils.pytorch import FasterCocoEvaluator
 
 from ...core import register
+from .area_filter import filter_coco_dataset_dict, resolve_area_ranges
 
 __all__ = [
     "CocoEvaluator",
@@ -19,9 +21,41 @@ __all__ = [
 
 @register()
 class CocoEvaluator(FasterCocoEvaluator):
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        allowed_area_labels=None,
+        allowed_area_ranges=None,
+        exclude_images_without_annotations=False,
+        reported_area_labels=None,
+        **kwargs,
+    ):
+        self.allowed_area_labels = tuple(allowed_area_labels) if allowed_area_labels else ()
+        self.allowed_area_ranges = resolve_area_ranges(
+            area_labels=allowed_area_labels,
+            area_ranges=allowed_area_ranges,
+        )
+        self.exclude_images_without_annotations = exclude_images_without_annotations
+        self.reported_area_labels = tuple(reported_area_labels) if reported_area_labels else ()
+
+        if "coco_gt" in kwargs and (
+            self.allowed_area_ranges or self.exclude_images_without_annotations
+        ):
+            kwargs["coco_gt"] = self._build_filtered_coco_gt(kwargs["coco_gt"])
+
         super().__init__(*args, **kwargs)
         self._apply_custom_area_bins()
+
+    def _build_filtered_coco_gt(self, coco_gt):
+        filtered_dataset = filter_coco_dataset_dict(
+            coco_gt.dataset,
+            self.allowed_area_ranges,
+            exclude_images_without_annotations=self.exclude_images_without_annotations,
+        )
+        filtered_coco_gt = COCO()
+        filtered_coco_gt.dataset = filtered_dataset
+        filtered_coco_gt.createIndex()
+        return filtered_coco_gt
 
     def _apply_custom_area_bins(self):
         # Align area bins with AITOD tiny-object analysis used in RT-DETR.

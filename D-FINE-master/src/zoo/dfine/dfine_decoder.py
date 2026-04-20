@@ -453,6 +453,7 @@ class TransformerDecoder(nn.Module):
             torch.stack(dec_out_refs),
             pre_bboxes,
             pre_scores,
+            output,
         )
 
 
@@ -490,6 +491,15 @@ class DFINETransformer(nn.Module):
         trust_enabled=False,
         trust_topk=4,
         trust_hidden_dim=64,
+        teacher_enabled=False,
+        teacher_mode="final",
+        teacher_layer_ids=None,
+        teacher_exclude_final=False,
+        teacher_tau_entropy=1.0,
+        teacher_tau_drift=1.0,
+        teacher_tau_conf=0.0,
+        teacher_detach=True,
+        teacher_use_prob_mixture=True,
     ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -512,9 +522,19 @@ class DFINETransformer(nn.Module):
         self.reg_max = reg_max
         self.trust_enabled = trust_enabled
         self.trust_topk = trust_topk
+        self.teacher_enabled = teacher_enabled
+        self.teacher_mode = teacher_mode
+        self.teacher_layer_ids = teacher_layer_ids
+        self.teacher_exclude_final = teacher_exclude_final
+        self.teacher_tau_entropy = teacher_tau_entropy
+        self.teacher_tau_drift = teacher_tau_drift
+        self.teacher_tau_conf = teacher_tau_conf
+        self.teacher_detach = teacher_detach
+        self.teacher_use_prob_mixture = teacher_use_prob_mixture
 
         assert query_select_method in ("default", "one2many", "agnostic"), ""
         assert cross_attn_method in ("default", "discrete"), ""
+        assert teacher_mode in ("final", "entropy_drift_mixture"), ""
         self.cross_attn_method = cross_attn_method
         self.query_select_method = query_select_method
 
@@ -872,7 +892,15 @@ class DFINETransformer(nn.Module):
         )
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
+        (
+            out_bboxes,
+            out_logits,
+            out_corners,
+            out_refs,
+            pre_bboxes,
+            pre_logits,
+            query_embeddings,
+        ) = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -896,8 +924,12 @@ class DFINETransformer(nn.Module):
 
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta["dn_num_split"], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta["dn_num_split"], dim=2)
+            _, query_embeddings = torch.split(query_embeddings, dn_meta["dn_num_split"], dim=1)
 
         trust_scores = self._predict_trust_scores(out_logits, out_bboxes, out_corners)
+        teacher_corners, teacher_logits, teacher_probs = self._build_teacher_from_layers(
+            out_logits, out_bboxes, out_corners
+        )
 
         if self.training:
             out = {
@@ -908,6 +940,7 @@ class DFINETransformer(nn.Module):
                 "up": self.up,
                 "reg_scale": self.reg_scale,
                 "trust_scores": trust_scores,
+                "query_embeddings": query_embeddings,
             }
         else:
             out = {"pred_logits": out_logits[-1], "pred_boxes": out_bboxes[-1]}
@@ -918,8 +951,9 @@ class DFINETransformer(nn.Module):
                 out_bboxes[:-1],
                 out_corners[:-1],
                 out_refs[:-1],
-                out_corners[-1],
-                out_logits[-1],
+                teacher_corners,
+                teacher_logits,
+                teacher_probs,
                 trust_scores,
             )
             out["enc_aux_outputs"] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
@@ -927,13 +961,17 @@ class DFINETransformer(nn.Module):
             out["enc_meta"] = {"class_agnostic": self.query_select_method == "agnostic"}
 
             if dn_meta is not None:
+                dn_teacher_corners, dn_teacher_logits, dn_teacher_probs = self._build_teacher_from_layers(
+                    dn_out_logits, dn_out_bboxes, dn_out_corners
+                )
                 out["dn_outputs"] = self._set_aux_loss2(
                     dn_out_logits,
                     dn_out_bboxes,
                     dn_out_corners,
                     dn_out_refs,
-                    dn_out_corners[-1],
-                    dn_out_logits[-1],
+                    dn_teacher_corners,
+                    dn_teacher_logits,
+                    dn_teacher_probs,
                 )
                 out["dn_pre_outputs"] = {"pred_logits": dn_pre_logits, "pred_boxes": dn_pre_bboxes}
                 out["dn_meta"] = dn_meta
@@ -965,6 +1003,74 @@ class DFINETransformer(nn.Module):
         trust_feat = torch.cat([entropy, top1, top2, topk_mass, cls_conf, drift, log_area], dim=-1)
         return torch.sigmoid(self.trust_head(trust_feat))
 
+    def _resolve_teacher_layer_ids(self, num_layers):
+        if self.teacher_layer_ids is None:
+            layer_ids = list(range(num_layers))
+        else:
+            layer_ids = []
+            for layer_id in self.teacher_layer_ids:
+                resolved_layer_id = layer_id if layer_id >= 0 else num_layers + layer_id
+                if resolved_layer_id < 0 or resolved_layer_id >= num_layers:
+                    raise ValueError(f"Invalid teacher layer id {layer_id} for {num_layers} layers.")
+                if resolved_layer_id not in layer_ids:
+                    layer_ids.append(resolved_layer_id)
+            layer_ids.sort()
+
+        if self.teacher_exclude_final:
+            layer_ids = [layer_id for layer_id in layer_ids if layer_id != num_layers - 1]
+
+        return layer_ids if layer_ids else [num_layers - 1]
+
+    def _build_teacher_from_layers(self, out_logits, out_bboxes, out_corners):
+        if not self.training:
+            return None, None, None
+
+        final_corners = out_corners[-1].detach() if self.teacher_detach else out_corners[-1]
+        final_logits = out_logits[-1].detach() if self.teacher_detach else out_logits[-1]
+
+        if not self.teacher_enabled or self.teacher_mode == "final":
+            return final_corners, final_logits, None
+
+        layer_ids = self._resolve_teacher_layer_ids(out_corners.shape[0])
+        teacher_corners = out_corners[layer_ids]
+        teacher_logits = out_logits[layer_ids]
+        teacher_boxes = out_bboxes[layer_ids]
+
+        if self.teacher_detach:
+            teacher_corners = teacher_corners.detach()
+            teacher_logits = teacher_logits.detach()
+            teacher_boxes = teacher_boxes.detach()
+            final_boxes = out_bboxes[-1].detach()
+        else:
+            final_boxes = out_bboxes[-1]
+
+        teacher_probs = F.softmax(
+            teacher_corners.reshape(
+                teacher_corners.shape[0], *teacher_corners.shape[1:3], 4, self.reg_max + 1
+            ),
+            dim=-1,
+        )
+        entropy = -(teacher_probs * torch.log(teacher_probs.clamp(min=1e-8))).sum(-1).mean(
+            -1, keepdim=True
+        )
+        drift = (teacher_boxes - final_boxes.unsqueeze(0)).abs().sum(-1, keepdim=True)
+        conf = teacher_logits.sigmoid().max(dim=-1, keepdim=True)[0]
+
+        teacher_score = (
+            -self.teacher_tau_entropy * entropy
+            - self.teacher_tau_drift * drift
+            + self.teacher_tau_conf * conf
+        )
+        teacher_weight = F.softmax(teacher_score, dim=0)
+
+        if self.teacher_use_prob_mixture:
+            teacher_probs = (teacher_weight.unsqueeze(-1) * teacher_probs).sum(dim=0)
+            teacher_probs = teacher_probs / teacher_probs.sum(-1, keepdim=True).clamp(min=1e-8)
+            return None, final_logits, teacher_probs
+
+        mixed_teacher_corners = (teacher_weight * teacher_corners).sum(dim=0)
+        return mixed_teacher_corners, final_logits, None
+
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):
         # this is a workaround to make torchscript happy, as torchscript
@@ -981,6 +1087,7 @@ class DFINETransformer(nn.Module):
         outputs_ref,
         teacher_corners=None,
         teacher_logits=None,
+        teacher_probs=None,
         trust_scores=None,
     ):
         # this is a workaround to make torchscript happy, as torchscript
@@ -994,6 +1101,7 @@ class DFINETransformer(nn.Module):
                 "ref_points": d,
                 "teacher_corners": teacher_corners,
                 "teacher_logits": teacher_logits,
+                "teacher_probs": teacher_probs,
                 "trust_scores": trust_scores,
             }
             for a, b, c, d in zip(outputs_class, outputs_coord, outputs_corners, outputs_ref)

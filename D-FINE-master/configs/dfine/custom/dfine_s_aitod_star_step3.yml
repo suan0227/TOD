@@ -1,0 +1,16 @@
+__include__: [
+  '../include/dfine_s_aitod_baseline.yml',
+]
+
+# Keep the STAR setup unchanged except for a lighter contrastive loss weight.
+output_dir: ./output/dfine_s_star_step3_contrastive_lw025
+exp_name: D-dfine_s_star_step3_contrastive_lw025
+
+DFINECriterion:
+  losses: ['vfl', 'boxes', 'local', 'contrastive']
+  weight_dict:
+    loss_contrastive: 0.25
+  contrastive_bank_size: 64
+  contrastive_momentum: 0.9
+  contrastive_margin: 0.4
+  contrastive_bg_iou_threshold: 0.1

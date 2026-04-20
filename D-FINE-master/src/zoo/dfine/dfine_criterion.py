@@ -18,6 +18,7 @@ from ...core import register
 from ...misc.dist_utils import get_world_size, is_dist_available_and_initialized
 from .box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
 from .dfine_utils import bbox2distance
+from .star.contrastive_head import ContrastiveHead
 
 
 @register()
@@ -44,6 +45,14 @@ class DFINECriterion(nn.Module):
         share_matched_indices=False,
         trust_alpha=0.5,
         trust_eps=1e-6,
+        trust_scale_weight_very_tiny=1.0,
+        trust_scale_weight_tiny=1.0,
+        trust_scale_weight_small=1.0,
+        trust_unmatched_kd_weight=1.0,
+        contrastive_bank_size=64,
+        contrastive_momentum=0.9,
+        contrastive_margin=0.4,
+        contrastive_bg_iou_threshold=0.1,
     ):
         """Create the criterion.
         Parameters:
@@ -69,6 +78,29 @@ class DFINECriterion(nn.Module):
         self.num_pos, self.num_neg = None, None
         self.trust_alpha = trust_alpha
         self.trust_eps = trust_eps
+        self.trust_scale_weight_very_tiny = trust_scale_weight_very_tiny
+        self.trust_scale_weight_tiny = trust_scale_weight_tiny
+        self.trust_scale_weight_small = trust_scale_weight_small
+        self.trust_unmatched_kd_weight = trust_unmatched_kd_weight
+
+        self.contrastive_head = None
+        if "contrastive" in self.losses:
+            self.contrastive_head = ContrastiveHead(
+                bank_size=contrastive_bank_size,
+                momentum=contrastive_momentum,
+                margin=contrastive_margin,
+                bg_iou_threshold=contrastive_bg_iou_threshold,
+            )
+
+    def load_state_dict(self, state_dict, strict=False):
+        # Keep checkpoint loading tolerant so baseline checkpoints can be used for tuning.
+        incompatible = super().load_state_dict(state_dict, strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            print(
+                "DFINECriterion.load_state_dict: "
+                f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+            )
+        return incompatible
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert "pred_logits" in outputs
@@ -160,8 +192,21 @@ class DFINECriterion(nn.Module):
 
         target = self.trust_alpha * ious + (1 - self.trust_alpha) * center_term
         pred = outputs["trust_scores"][idx].squeeze(-1)
-        loss = F.smooth_l1_loss(pred, target, reduction="sum") / num_boxes
+        scale_weights = self._get_matched_scale_weights(targets, indices, pred.device, pred.dtype)
+        loss = F.smooth_l1_loss(pred, target, reduction="none")
+        loss = (loss * scale_weights).sum() / num_boxes
         return {"loss_trust": loss}
+
+    def loss_contrastive(self, outputs, targets, indices, num_boxes):
+        if self.contrastive_head is None:
+            return {"loss_contrastive": outputs["pred_boxes"].sum() * 0}
+
+        query_embeddings = outputs.get("query_embeddings")
+        if query_embeddings is None:
+            return {"loss_contrastive": outputs["pred_boxes"].sum() * 0}
+
+        loss = self.contrastive_head(query_embeddings, outputs["pred_boxes"], targets, indices)
+        return {"loss_contrastive": loss}
 
     def loss_local(self, outputs, targets, indices, num_boxes, T=5):
         """Compute Fine-Grained Localization (FGL) Loss
@@ -212,26 +257,37 @@ class DFINECriterion(nn.Module):
                 avg_factor=num_boxes,
             )
 
-            if "teacher_corners" in outputs:
+            if outputs.get("teacher_corners") is not None or outputs.get("teacher_probs") is not None:
                 pred_corners = outputs["pred_corners"].reshape(-1, (self.reg_max + 1))
-                target_corners = outputs["teacher_corners"].reshape(-1, (self.reg_max + 1))
-                if torch.equal(pred_corners, target_corners):
+                teacher_probs = outputs.get("teacher_probs")
+                if teacher_probs is None:
+                    target_corners = outputs["teacher_corners"].reshape(-1, (self.reg_max + 1))
+                    target_probs = F.softmax(target_corners.detach() / T, dim=1)
+                else:
+                    target_probs = teacher_probs.reshape(-1, (self.reg_max + 1)).detach()
+                    target_probs = target_probs.to(pred_corners.dtype)
+                    target_probs = target_probs / target_probs.sum(-1, keepdim=True).clamp(
+                        min=self.trust_eps
+                    )
+                if teacher_probs is None and torch.equal(pred_corners, target_corners):
                     losses["loss_ddf"] = pred_corners.sum() * 0
                 else:
                     weight_targets_local = outputs["teacher_logits"].sigmoid().max(dim=-1)[0]
-                    weight_targets_local = weight_targets_local.clone()
+                    weight_targets_local = (
+                        weight_targets_local.clone() * self.trust_unmatched_kd_weight
+                    )
                     query_mask = torch.zeros_like(weight_targets_local, dtype=torch.bool)
                     query_mask[idx] = True
+                    matched_scale_weights = self._get_matched_scale_weights(
+                        targets, indices, weight_targets_local.device, weight_targets_local.dtype
+                    )
 
                     if "trust_scores" in outputs and outputs["trust_scores"] is not None:
-                        trust_scores = outputs["trust_scores"].squeeze(-1).detach()
-                        weight_targets_local[query_mask] = trust_scores[query_mask].to(
-                            weight_targets_local.dtype
-                        )
+                        matched_query_weights = outputs["trust_scores"][idx].squeeze(-1).detach()
+                        matched_query_weights = matched_query_weights.to(weight_targets_local.dtype)
                     else:
-                        weight_targets_local[query_mask] = ious.reshape_as(
-                            weight_targets_local[query_mask]
-                        ).to(weight_targets_local.dtype)
+                        matched_query_weights = ious.to(weight_targets_local.dtype)
+                    weight_targets_local[idx] = matched_query_weights * matched_scale_weights
 
                     mask = query_mask.unsqueeze(-1).repeat(1, 1, 4).reshape(-1)
                     weight_targets_local = (
@@ -244,7 +300,7 @@ class DFINECriterion(nn.Module):
                         * (
                             nn.KLDivLoss(reduction="none")(
                                 F.log_softmax(pred_corners / T, dim=1),
-                                F.softmax(target_corners.detach() / T, dim=1),
+                                target_probs,
                             )
                         ).sum(-1)
                     )
@@ -256,13 +312,60 @@ class DFINECriterion(nn.Module):
                             (mask.sum() * batch_scale) ** 0.5,
                             ((~mask).sum() * batch_scale) ** 0.5,
                         )
-                    loss_match_local1 = loss_match_local[mask].mean() if mask.any() else 0
-                    loss_match_local2 = loss_match_local[~mask].mean() if (~mask).any() else 0
+                    zero = pred_corners.sum() * 0
+                    loss_match_local1 = loss_match_local[mask].mean() if mask.any() else zero
+                    if (~mask).any() and self.trust_unmatched_kd_weight > 0:
+                        loss_match_local2 = loss_match_local[~mask].mean()
+                        neg_balance = self.num_neg
+                    else:
+                        loss_match_local2 = zero
+                        neg_balance = self.num_neg * 0
                     losses["loss_ddf"] = (
-                        loss_match_local1 * self.num_pos + loss_match_local2 * self.num_neg
-                    ) / (self.num_pos + self.num_neg)
+                        loss_match_local1 * self.num_pos + loss_match_local2 * neg_balance
+                    ) / (self.num_pos + neg_balance).clamp(min=self.trust_eps)
 
         return losses
+
+    def _get_matched_target_areas(self, targets, indices, device, dtype):
+        matched_areas = []
+        for target, (_, tgt_idx) in zip(targets, indices):
+            if tgt_idx.numel() == 0:
+                continue
+
+            if "area" in target:
+                matched_areas.append(target["area"][tgt_idx].to(device=device, dtype=dtype))
+                continue
+
+            boxes = target["boxes"][tgt_idx].to(device=device, dtype=dtype)
+            if "size" in target:
+                size = target["size"].to(device=device, dtype=dtype)
+                height, width = size[0], size[1]
+                matched_areas.append((boxes[:, 2] * width) * (boxes[:, 3] * height))
+            elif "orig_size" in target:
+                orig_size = target["orig_size"].to(device=device, dtype=dtype)
+                width, height = orig_size[0], orig_size[1]
+                matched_areas.append((boxes[:, 2] * width) * (boxes[:, 3] * height))
+            else:
+                matched_areas.append((boxes[:, 2] * boxes[:, 3]).to(device=device, dtype=dtype))
+
+        if matched_areas:
+            return torch.cat(matched_areas, dim=0)
+        return torch.zeros(0, device=device, dtype=dtype)
+
+    def _get_matched_scale_weights(self, targets, indices, device, dtype):
+        areas = self._get_matched_target_areas(targets, indices, device, dtype)
+        if areas.numel() == 0:
+            return torch.ones(0, device=device, dtype=dtype)
+
+        scale_weights = torch.ones_like(areas, device=device, dtype=dtype)
+        very_tiny_mask = (areas >= 2**2) & (areas < 8**2)
+        tiny_mask = (areas >= 8**2) & (areas < 16**2)
+        small_mask = (areas >= 16**2) & (areas < 32**2)
+
+        scale_weights[very_tiny_mask] = self.trust_scale_weight_very_tiny
+        scale_weights[tiny_mask] = self.trust_scale_weight_tiny
+        scale_weights[small_mask] = self.trust_scale_weight_small
+        return scale_weights
 
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
@@ -311,6 +414,7 @@ class DFINECriterion(nn.Module):
             "vfl": self.loss_labels_vfl,
             "local": self.loss_local,
             "trust": self.loss_trust,
+            "contrastive": self.loss_contrastive,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -375,7 +479,7 @@ class DFINECriterion(nn.Module):
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
                 aux_outputs["up"], aux_outputs["reg_scale"] = outputs["up"], outputs["reg_scale"]
                 for loss in self.losses:
-                    if loss == "trust":
+                    if loss in ["trust", "contrastive"]:
                         continue
                     indices_in = indices_go if loss in ["boxes", "local"] else cached_indices[i]
                     num_boxes_in = num_boxes_go if loss in ["boxes", "local"] else num_boxes
@@ -394,7 +498,7 @@ class DFINECriterion(nn.Module):
         if "pre_outputs" in outputs:
             aux_outputs = outputs["pre_outputs"]
             for loss in self.losses:
-                if loss == "trust":
+                if loss in ["trust", "contrastive"]:
                     continue
                 indices_in = indices_go if loss in ["boxes", "local"] else cached_indices[-1]
                 num_boxes_in = num_boxes_go if loss in ["boxes", "local"] else num_boxes
@@ -422,7 +526,7 @@ class DFINECriterion(nn.Module):
 
             for i, aux_outputs in enumerate(outputs["enc_aux_outputs"]):
                 for loss in self.losses:
-                    if loss == "trust":
+                    if loss in ["trust", "contrastive"]:
                         continue
                     indices_in = indices_go if loss == "boxes" else cached_indices_enc[i]
                     num_boxes_in = num_boxes_go if loss == "boxes" else num_boxes
@@ -450,7 +554,7 @@ class DFINECriterion(nn.Module):
                 aux_outputs["is_dn"] = True
                 aux_outputs["up"], aux_outputs["reg_scale"] = outputs["up"], outputs["reg_scale"]
                 for loss in self.losses:
-                    if loss == "trust":
+                    if loss in ["trust", "contrastive"]:
                         continue
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_dn)
                     l_dict = self.get_loss(
@@ -466,7 +570,7 @@ class DFINECriterion(nn.Module):
             if "dn_pre_outputs" in outputs:
                 aux_outputs = outputs["dn_pre_outputs"]
                 for loss in self.losses:
-                    if loss == "trust":
+                    if loss in ["trust", "contrastive"]:
                         continue
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_dn)
                     l_dict = self.get_loss(

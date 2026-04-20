@@ -1,4 +1,5 @@
 __include__: [
+  # '../../dataset/custom_detection.yml',
   '../../dataset/aitod_detection.yml',
   '../../runtime.yml',
   '../include/dataloader.yml',
@@ -6,12 +7,15 @@ __include__: [
   '../include/dfine_hgnetv2.yml',
 ]
 
-output_dir: ./output/dfine_s_baseline
-exp_name: D-dfine_s_baseline
+output_dir: ./output/dfine_s_baseline_filtering
 
 evaluator:
   type: CocoEvaluator
   iou_types: ['bbox']
+  allowed_area_labels: ['tiny', 'small']
+  exclude_images_without_annotations: True
+  reported_area_labels: ['tiny', 'small']
+
 
 DFINE:
   backbone: HGNetv2
@@ -24,8 +28,8 @@ HGNetv2:
   use_lab: True
 
 DFINETransformer:
-  num_layers: 3
-  eval_idx: -1
+  num_layers: 3  # 4 5 6
+  eval_idx: -1  # -2 -3 -4
 
 HybridEncoder:
   in_channels: [256, 512, 1024]
@@ -46,25 +50,29 @@ optimizer:
     -
       params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
       weight_decay: 0.
+
   lr: 0.0004
   betas: [0.9, 0.999]
   weight_decay: 0.0001
 
-use_amp: False
-use_ema: True
-epochs: 220
-resume: output/dfine_hgnetv2_s_aitod/last.pth
 
+# Increase to search for the optimal ema
+epochs: 300
 train_dataloader:
   total_batch_size: 8
   dataset:
+    allowed_area_labels: ['tiny', 'small']
+    exclude_images_without_valid_annotations: True
     transforms:
       policy:
-        epoch: 200
+        epoch: 272
   collate_fn:
-    stop_epoch: 200
+    stop_epoch: 272
     ema_restart_decay: 0.9999
     base_size_repeat: 20
 
 val_dataloader:
   total_batch_size: 8
+  dataset:
+    allowed_area_labels: ['tiny', 'small']
+    exclude_images_without_valid_annotations: True

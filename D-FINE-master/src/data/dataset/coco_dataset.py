@@ -15,6 +15,7 @@ from PIL import Image
 from ...core import register
 from .._misc import convert_to_tv_tensor
 from ._dataset import DetDataset
+from .area_filter import filter_annotations_by_area, resolve_area_ranges
 
 torchvision.disable_beta_transforms_warning()
 Image.MAX_IMAGE_PIXELS = None
@@ -30,15 +31,42 @@ class CocoDetection(FasterCocoDetection, DetDataset):
     __share__ = ["remap_mscoco_category"]
 
     def __init__(
-        self, img_folder, ann_file, transforms, return_masks=False, remap_mscoco_category=False
+        self,
+        img_folder,
+        ann_file,
+        transforms,
+        return_masks=False,
+        remap_mscoco_category=False,
+        allowed_area_labels=None,
+        allowed_area_ranges=None,
+        exclude_images_without_valid_annotations=False,
     ):
         super(FasterCocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
-        self.prepare = ConvertCocoPolysToMask(return_masks)
+        self.allowed_area_labels = tuple(allowed_area_labels) if allowed_area_labels else ()
+        self.allowed_area_ranges = resolve_area_ranges(
+            area_labels=allowed_area_labels,
+            area_ranges=allowed_area_ranges,
+        )
+        self.exclude_images_without_valid_annotations = exclude_images_without_valid_annotations
+        self.prepare = ConvertCocoPolysToMask(
+            return_masks,
+            allowed_area_ranges=self.allowed_area_ranges,
+        )
         self.img_folder = img_folder
         self.ann_file = ann_file
         self.return_masks = return_masks
         self.remap_mscoco_category = remap_mscoco_category
+        self.filtered_out_image_count = 0
+
+        if self.exclude_images_without_valid_annotations:
+            num_images_before_filter = len(self.ids)
+            self.ids = self._filter_image_ids_with_valid_annotations()
+            self.filtered_out_image_count = num_images_before_filter - len(self.ids)
+
+        self.requires_coco_conversion = bool(
+            self.allowed_area_ranges or self.exclude_images_without_valid_annotations
+        )
 
     def __getitem__(self, idx):
         img, target = self.load_item(idx)
@@ -72,6 +100,11 @@ class CocoDetection(FasterCocoDetection, DetDataset):
     def extra_repr(self) -> str:
         s = f" img_folder: {self.img_folder}\n ann_file: {self.ann_file}\n"
         s += f" return_masks: {self.return_masks}\n"
+        if self.allowed_area_labels:
+            s += f" allowed_area_labels: {list(self.allowed_area_labels)}\n"
+        if self.exclude_images_without_valid_annotations:
+            s += " exclude_images_without_valid_annotations: True\n"
+            s += f" filtered_out_image_count: {self.filtered_out_image_count}\n"
         if hasattr(self, "_transforms") and self._transforms is not None:
             s += f" transforms:\n   {repr(self._transforms)}"
         if hasattr(self, "_preset") and self._preset is not None:
@@ -102,6 +135,31 @@ class CocoDetection(FasterCocoDetection, DetDataset):
     ):
         return {i: cat["id"] for i, cat in enumerate(self.categories)}
 
+    def _filter_image_ids_with_valid_annotations(self):
+        valid_image_ids = []
+        for image_id in self.ids:
+            ann_ids = self.coco.getAnnIds(imgIds=image_id, iscrowd=None)
+            annotations = self.coco.loadAnns(ann_ids)
+            annotations = [obj for obj in annotations if "iscrowd" not in obj or obj["iscrowd"] == 0]
+            annotations = filter_annotations_by_area(annotations, self.allowed_area_ranges)
+
+            if self._has_valid_annotation(annotations):
+                valid_image_ids.append(image_id)
+
+        return valid_image_ids
+
+    @staticmethod
+    def _has_valid_annotation(annotations):
+        if len(annotations) == 0:
+            return False
+
+        return any(
+            len(annotation.get("bbox", [])) >= 4
+            and annotation["bbox"][2] > 1
+            and annotation["bbox"][3] > 1
+            for annotation in annotations
+        )
+
 
 def convert_coco_poly_to_mask(segmentations, height, width):
     masks = []
@@ -121,8 +179,9 @@ def convert_coco_poly_to_mask(segmentations, height, width):
 
 
 class ConvertCocoPolysToMask(object):
-    def __init__(self, return_masks=False):
+    def __init__(self, return_masks=False, allowed_area_ranges=None):
         self.return_masks = return_masks
+        self.allowed_area_ranges = allowed_area_ranges or []
 
     def __call__(self, image: Image.Image, target, **kwargs):
         w, h = image.size
@@ -135,6 +194,7 @@ class ConvertCocoPolysToMask(object):
         anno = target["annotations"]
 
         anno = [obj for obj in anno if "iscrowd" not in obj or obj["iscrowd"] == 0]
+        anno = filter_annotations_by_area(anno, self.allowed_area_ranges)
 
         boxes = [obj["bbox"] for obj in anno]
         # guard against no boxes via resizing

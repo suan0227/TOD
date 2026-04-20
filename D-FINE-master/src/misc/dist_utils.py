@@ -248,7 +248,6 @@ def setup_seed(seed: int, deterministic=False):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    # memory will be large when setting deterministic to True
     if torch.backends.cudnn.is_available() and deterministic:
         torch.backends.cudnn.deterministic = True
 

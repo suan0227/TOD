@@ -22,20 +22,36 @@ from ..misc import MetricLogger, SmoothedValue, dist_utils, save_samples
 from ..optim import ModelEMA, Warmup
 from .validator import Validator, scale_boxes
 
+AREA_METRIC_KEYS = {
+    "very_tiny": "AP_very_tiny",
+    "tiny": "AP_tiny",
+    "small": "AP_s",
+    "medium": "AP_m",
+    "large": "AP_l",
+}
+
 
 def _compute_ap_for_area(coco_eval_obj, area_label, max_det_idx=-1):
     """Compute mean AP for a named area range from COCO precision tensor."""
     area_labels = coco_eval_obj.params.areaRngLbl
     if area_label not in area_labels:
-        return float("nan")
+        return None
 
     area_idx = area_labels.index(area_label)
     # precision shape: [TxRxKxAxM]
     precision = coco_eval_obj.eval["precision"][:, :, :, area_idx, max_det_idx]
     valid_precision = precision[precision > -1]
     if valid_precision.size == 0:
-        return float("nan")
+        return None
     return float(np.mean(valid_precision))
+
+
+def _get_reported_area_labels(coco_evaluator, bbox_eval):
+    reported_area_labels = getattr(coco_evaluator, "reported_area_labels", ())
+    if reported_area_labels:
+        return tuple(area_label for area_label in reported_area_labels if area_label != "all")
+
+    return tuple(area_label for area_label in bbox_eval.params.areaRngLbl if area_label != "all")
 
 
 def train_one_epoch(
@@ -269,11 +285,10 @@ def evaluate(
         if "bbox" in iou_types:
             bbox_eval = coco_evaluator.coco_eval["bbox"]
             stats["coco_eval_bbox"] = bbox_eval.stats.tolist()
-            stats["AP_very_tiny"] = _compute_ap_for_area(bbox_eval, "very_tiny")
-            stats["AP_tiny"] = _compute_ap_for_area(bbox_eval, "tiny")
-            stats["AP_s"] = _compute_ap_for_area(bbox_eval, "small")
-            stats["AP_m"] = _compute_ap_for_area(bbox_eval, "medium")
-            stats["AP_l"] = _compute_ap_for_area(bbox_eval, "large")
+            for area_label in _get_reported_area_labels(coco_evaluator, bbox_eval):
+                area_ap = _compute_ap_for_area(bbox_eval, area_label)
+                if area_ap is not None:
+                    stats[AREA_METRIC_KEYS.get(area_label, f"AP_{area_label}")] = area_ap
         if "segm" in iou_types:
             stats["coco_eval_masks"] = coco_evaluator.coco_eval["segm"].stats.tolist()
 
